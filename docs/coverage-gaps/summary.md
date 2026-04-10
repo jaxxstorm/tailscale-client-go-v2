@@ -3,10 +3,12 @@
 | Area | OpenAPI | Implemented | Missing |
 | --- | ---: | ---: | ---: |
 | Endpoint operations | 85 | 53 | 32 |
-| Device properties | 42 | 40 | 2 |
+| API models | 30 | 17 | 13 |
+| API model properties | 259 | 172 | 87 |
 
 - Spec: `tools/openapi/spec/tailscale-v2-openapi.yaml`
 - Repo: `.`
 - Reports:
   - `endpoint-coverage.md`
-  - `device-property-coverage.md`
+  - `model-coverage.md`
+  - `model-property-coverage.md`

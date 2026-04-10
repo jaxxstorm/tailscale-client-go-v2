@@ -22,6 +22,12 @@ type Operation struct {
 	Tags           []string
 }
 
+type Model struct {
+	Name       string
+	Ref        string
+	Properties []string
+}
+
 func Load(path string) (*Spec, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -92,71 +98,37 @@ func (s *Spec) Operations() ([]Operation, error) {
 	return operations, nil
 }
 
-func (s *Spec) DeviceProperties() ([]string, error) {
-	candidates := []struct {
-		method       string
-		path         string
-		selectSchema func(any) (any, error)
-	}{
-		{
-			method: "get",
-			path:   "/device/{deviceId}",
-			selectSchema: func(schema any) (any, error) {
-				return schema, nil
-			},
-		},
-		{
-			method: "get",
-			path:   "/tailnet/{tailnet}/devices",
-			selectSchema: func(schema any) (any, error) {
-				root, ok := mapValue(schema)
-				if !ok {
-					return nil, fmt.Errorf("device collection response schema is not an object")
-				}
-
-				properties, ok := mapValue(root["properties"])
-				if !ok {
-					return nil, fmt.Errorf("device collection response schema has no properties")
-				}
-
-				devices, ok := mapValue(properties["devices"])
-				if !ok {
-					return nil, fmt.Errorf("device collection response schema has no devices property")
-				}
-
-				items, ok := mapValue(devices["items"])
-				if !ok {
-					return nil, fmt.Errorf("device collection devices property has no items schema")
-				}
-
-				return items, nil
-			},
-		},
+func (s *Spec) Models() ([]Model, error) {
+	refs, err := s.reachableSchemaRefs()
+	if err != nil {
+		return nil, err
 	}
 
-	paths := make(map[string]struct{})
-	for _, candidate := range candidates {
-		operation, err := s.operation(candidate.path, candidate.method)
+	models := make([]Model, 0, len(refs))
+	for _, ref := range refs {
+		schema, err := s.resolveRef(ref)
 		if err != nil {
 			return nil, err
 		}
 
-		schema, err := responseSchema(operation)
-		if err != nil {
-			return nil, fmt.Errorf("%s %s: %w", strings.ToUpper(candidate.method), candidate.path, err)
+		if !isModelSchema(schema) {
+			continue
 		}
 
-		selected, err := candidate.selectSchema(schema)
-		if err != nil {
-			return nil, fmt.Errorf("%s %s: %w", strings.ToUpper(candidate.method), candidate.path, err)
+		properties := make(map[string]struct{})
+		if err := s.collectLeafProperties(schema, "", properties, map[string]bool{}); err != nil {
+			return nil, fmt.Errorf("collect properties for %s: %w", ref, err)
 		}
 
-		if err := s.collectLeafProperties(selected, "", paths, map[string]bool{}); err != nil {
-			return nil, fmt.Errorf("%s %s: %w", strings.ToUpper(candidate.method), candidate.path, err)
-		}
+		models = append(models, Model{
+			Name:       schemaNameFromRef(ref),
+			Ref:        ref,
+			Properties: sortedSet(properties),
+		})
 	}
 
-	return sortedSet(paths), nil
+	slicesSortModels(models)
+	return models, nil
 }
 
 func (s *Spec) operation(path, method string) (map[string]any, error) {
@@ -178,39 +150,167 @@ func (s *Spec) operation(path, method string) (map[string]any, error) {
 	return operation, nil
 }
 
-func responseSchema(operation map[string]any) (any, error) {
-	responses, ok := mapValue(operation["responses"])
+func (s *Spec) reachableSchemaRefs() ([]string, error) {
+	paths, ok := mapValue(s.document["paths"])
 	if !ok {
-		return nil, fmt.Errorf("responses are missing")
+		return nil, fmt.Errorf("spec is missing paths")
 	}
 
-	var response map[string]any
-	for _, status := range []string{"200", "201", "202"} {
-		if candidate, ok := mapValue(responses[status]); ok {
-			response = candidate
-			break
+	refs := make(map[string]struct{})
+	for _, path := range sortedKeys(paths) {
+		pathItem, ok := mapValue(paths[path])
+		if !ok {
+			continue
+		}
+
+		for _, method := range []string{"get", "post", "put", "patch", "delete"} {
+			operation, ok := mapValue(pathItem[method])
+			if !ok {
+				continue
+			}
+
+			if err := s.collectRefsFromOperation(operation, refs); err != nil {
+				return nil, fmt.Errorf("%s %s: %w", strings.ToUpper(method), path, err)
+			}
 		}
 	}
-	if response == nil {
-		return nil, fmt.Errorf("no JSON success response found")
+
+	return sortedSet(refs), nil
+}
+
+func (s *Spec) collectRefsFromOperation(operation map[string]any, refs map[string]struct{}) error {
+	if requestBody, ok := operation["requestBody"]; ok {
+		if err := s.collectRefsFromRequestBody(requestBody, refs); err != nil {
+			return err
+		}
 	}
 
-	content, ok := mapValue(response["content"])
+	responses, ok := mapValue(operation["responses"])
 	if !ok {
-		return nil, fmt.Errorf("response content is missing")
+		return nil
 	}
 
-	mediaType, ok := mapValue(content["application/json"])
+	for _, status := range sortedKeys(responses) {
+		if err := s.collectRefsFromResponse(responses[status], refs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Spec) collectRefsFromRequestBody(requestBody any, refs map[string]struct{}) error {
+	resolved, err := s.resolveMaybeRef(requestBody)
+	if err != nil {
+		return err
+	}
+
+	bodyMap, ok := mapValue(resolved)
 	if !ok {
-		return nil, fmt.Errorf("application/json content is missing")
+		return nil
 	}
 
-	schema, ok := mediaType["schema"]
+	content, ok := mapValue(bodyMap["content"])
 	if !ok {
-		return nil, fmt.Errorf("response schema is missing")
+		return nil
 	}
 
-	return schema, nil
+	for _, mediaType := range []string{"application/json", "application/hujson"} {
+		if media, ok := mapValue(content[mediaType]); ok {
+			if schema, ok := media["schema"]; ok {
+				return s.collectSchemaRefs(schema, refs, map[string]bool{})
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *Spec) collectRefsFromResponse(response any, refs map[string]struct{}) error {
+	resolved, err := s.resolveMaybeRef(response)
+	if err != nil {
+		return err
+	}
+
+	responseMap, ok := mapValue(resolved)
+	if !ok {
+		return nil
+	}
+
+	content, ok := mapValue(responseMap["content"])
+	if !ok {
+		return nil
+	}
+
+	if media, ok := mapValue(content["application/json"]); ok {
+		if schema, ok := media["schema"]; ok {
+			return s.collectSchemaRefs(schema, refs, map[string]bool{})
+		}
+	}
+
+	return nil
+}
+
+func (s *Spec) collectSchemaRefs(schema any, refs map[string]struct{}, stack map[string]bool) error {
+	schemaMap, ok := mapValue(schema)
+	if !ok {
+		return nil
+	}
+
+	if ref := stringValue(schemaMap["$ref"]); ref != "" {
+		if stack[ref] {
+			return nil
+		}
+
+		nextStack := copyStack(stack)
+		nextStack[ref] = true
+
+		if strings.HasPrefix(ref, "#/components/schemas/") {
+			refs[ref] = struct{}{}
+		}
+
+		resolved, err := s.resolveRefAny(ref)
+		if err != nil {
+			return err
+		}
+
+		return s.collectSchemaRefs(resolved, refs, nextStack)
+	}
+
+	for _, combiner := range []string{"allOf", "anyOf", "oneOf"} {
+		items, ok := sliceValue(schemaMap[combiner])
+		if !ok {
+			continue
+		}
+
+		for _, item := range items {
+			if err := s.collectSchemaRefs(item, refs, stack); err != nil {
+				return err
+			}
+		}
+	}
+
+	if properties, ok := mapValue(schemaMap["properties"]); ok {
+		for _, name := range sortedKeys(properties) {
+			if err := s.collectSchemaRefs(properties[name], refs, stack); err != nil {
+				return err
+			}
+		}
+	}
+
+	if items, ok := schemaMap["items"]; ok {
+		if err := s.collectSchemaRefs(items, refs, stack); err != nil {
+			return err
+		}
+	}
+
+	if additionalProperties, ok := schemaMap["additionalProperties"]; ok {
+		if err := s.collectSchemaRefs(additionalProperties, refs, stack); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *Spec) collectLeafProperties(schema any, prefix string, out map[string]struct{}, stack map[string]bool) error {
@@ -283,6 +383,20 @@ func (s *Spec) collectLeafProperties(schema any, prefix string, out map[string]s
 }
 
 func (s *Spec) resolveRef(ref string) (map[string]any, error) {
+	resolved, err := s.resolveRefAny(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	mapped, ok := mapValue(resolved)
+	if !ok {
+		return nil, fmt.Errorf("ref %q does not resolve to an object", ref)
+	}
+
+	return mapped, nil
+}
+
+func (s *Spec) resolveRefAny(ref string) (any, error) {
 	if !strings.HasPrefix(ref, "#/") {
 		return nil, fmt.Errorf("unsupported ref %q", ref)
 	}
@@ -301,12 +415,20 @@ func (s *Spec) resolveRef(ref string) (map[string]any, error) {
 		}
 	}
 
-	resolved, ok := mapValue(current)
+	return current, nil
+}
+
+func (s *Spec) resolveMaybeRef(value any) (any, error) {
+	mapped, ok := mapValue(value)
 	if !ok {
-		return nil, fmt.Errorf("ref %q does not resolve to an object", ref)
+		return value, nil
 	}
 
-	return resolved, nil
+	if ref := stringValue(mapped["$ref"]); ref != "" {
+		return s.resolveRefAny(ref)
+	}
+
+	return value, nil
 }
 
 func decodePointerToken(token string) string {
@@ -389,4 +511,37 @@ func copyStack(values map[string]bool) map[string]bool {
 	}
 
 	return out
+}
+
+func schemaNameFromRef(ref string) string {
+	parts := strings.Split(ref, "/")
+	return parts[len(parts)-1]
+}
+
+func isModelSchema(schema map[string]any) bool {
+	if _, ok := mapValue(schema["properties"]); ok {
+		return true
+	}
+	if _, ok := schema["additionalProperties"]; ok {
+		return true
+	}
+	if _, ok := schema["items"]; ok {
+		return true
+	}
+	if schemaType := stringValue(schema["type"]); schemaType == "object" {
+		return true
+	}
+	for _, combiner := range []string{"allOf", "anyOf", "oneOf"} {
+		if _, ok := sliceValue(schema[combiner]); ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+func slicesSortModels(models []Model) {
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].Name < models[j].Name
+	})
 }

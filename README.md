@@ -121,4 +121,4 @@ Pushing a tag of the format `vX.Y.Z` will trigger the [release workflow](./.gith
 The repository now includes two small Go tools for tracking API coverage drift against the upstream OpenAPI schema.
 
 - `make openapi-refresh` downloads the latest OpenAPI document to `tools/openapi/spec/tailscale-v2-openapi.yaml`.
-- `make coverage-gaps` reads that schema and writes markdown coverage reports to `docs/coverage-gaps/`.
+- `make coverage-gaps` reads that schema and writes markdown coverage reports for endpoints, models, and model properties to `docs/coverage-gaps/`.

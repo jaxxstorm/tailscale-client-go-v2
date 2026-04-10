@@ -35,25 +35,20 @@ func (c *Client) buildURL(pathElements ...any) *url.URL { return nil }
 func (c *Client) buildTailnetURL(pathElements ...any) *url.URL { return nil }
 
 type DevicesResource struct{ *Client }
-
-type DERPRegion struct {
-	Preferred           bool    ` + "`json:\"preferred,omitempty\"`" + `
-	LatencyMilliseconds float64 ` + "`json:\"latencyMs\"`" + `
-}
-
-type ClientConnectivity struct {
-	Latency map[string]DERPRegion ` + "`json:\"latency\"`" + `
-}
-
-type DevicePostureIdentity struct {
-	SerialNumbers []string ` + "`json:\"serialNumbers\"`" + `
-}
+type WebhooksResource struct{ *Client }
 
 type Device struct {
-	ID                 string                 ` + "`json:\"id\"`" + `
-	AdvertisedRoutes   []string               ` + "`json:\"AdvertisedRoutes\"`" + `
-	ClientConnectivity *ClientConnectivity    ` + "`json:\"clientConnectivity\"`" + `
-	PostureIdentity    *DevicePostureIdentity ` + "`json:\"postureIdentity\"`" + `
+	ID               string ` + "`json:\"id\"`" + `
+	ClientVersion    string ` + "`json:\"clientVersion\"`" + `
+}
+
+type Webhook struct {
+	EndpointID string ` + "`json:\"endpointId\"`" + `
+	Secret     string ` + "`json:\"secret\"`" + `
+}
+
+type ExtraModel struct {
+	Value string ` + "`json:\"value\"`" + `
 }
 
 func (dr *DevicesResource) Get(ctx context.Context, deviceID string) error {
@@ -61,31 +56,14 @@ func (dr *DevicesResource) Get(ctx context.Context, deviceID string) error {
 	return nil
 }
 
-func (dr *DevicesResource) List(ctx context.Context) error {
-	_, _ = dr.buildRequest(ctx, http.MethodGet, dr.buildTailnetURL("devices"))
+func (wr *WebhooksResource) List(ctx context.Context) error {
+	_, _ = wr.buildRequest(ctx, http.MethodGet, wr.buildTailnetURL("webhooks"))
 	return nil
 }
 `
 
 	const spec = `openapi: 3.1.0
 paths:
-  /tailnet/{tailnet}/devices:
-    get:
-      operationId: listTailnetDevices
-      summary: List tailnet devices
-      tags:
-        - Devices
-      responses:
-        '200':
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  devices:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Device'
   /device/{deviceId}:
     get:
       operationId: getDevice
@@ -107,6 +85,18 @@ paths:
       responses:
         '200':
           description: OK
+  /tailnet/{tailnet}/webhooks:
+    get:
+      operationId: listWebhooks
+      summary: List webhooks
+      tags:
+        - Webhooks
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
 components:
   schemas:
     Device:
@@ -114,35 +104,18 @@ components:
       properties:
         id:
           type: string
-        advertisedRoutes:
-          type: array
-          items:
-            type: string
+        clientVersion:
+          type: string
         multipleConnections:
           type: boolean
-        postureIdentity:
-          type: object
-          properties:
-            serialNumbers:
-              type: array
-              items:
-                type: string
-            hardwareAddresses:
-              type: array
-              items:
-                type: string
-        clientConnectivity:
-          type: object
-          properties:
-            latency:
-              type: object
-              additionalProperties:
-                type: object
-                properties:
-                  preferred:
-                    type: boolean
-                  latencyMs:
-                    type: number
+    Webhook:
+      type: object
+      properties:
+        endpointId:
+          type: string
+        created:
+          type: string
+          format: date-time
 `
 
 	if err := os.WriteFile(filepath.Join(repoRoot, "sample.go"), []byte(repoSource), 0o644); err != nil {
@@ -171,19 +144,38 @@ components:
 		t.Fatalf("missing operations = %#v, want expireDeviceKey", report.Endpoint.Missing)
 	}
 
-	missingProperties := strings.Join(report.Device.Missing, ",")
-	for _, want := range []string{
-		"advertisedRoutes",
-		"multipleConnections",
-		"postureIdentity.hardwareAddresses",
-	} {
-		if !strings.Contains(missingProperties, want) {
-			t.Fatalf("missing properties %q did not contain %q", missingProperties, want)
+	if report.Model.TotalSpecModels != 2 {
+		t.Fatalf("TotalSpecModels = %d, want 2", report.Model.TotalSpecModels)
+	}
+	if report.Model.CoveredModels != 2 {
+		t.Fatalf("CoveredModels = %d, want 2", report.Model.CoveredModels)
+	}
+	if len(report.Model.ExtraModels) != 1 || report.Model.ExtraModels[0].Name != "ExtraModel" {
+		t.Fatalf("ExtraModels = %#v, want ExtraModel", report.Model.ExtraModels)
+	}
+
+	var deviceMatch, webhookMatch *ModelMatch
+	for i := range report.Model.Matches {
+		match := &report.Model.Matches[i]
+		switch match.Spec.Name {
+		case "Device":
+			deviceMatch = match
+		case "Webhook":
+			webhookMatch = match
 		}
 	}
 
-	if len(report.Device.Extra) != 1 || report.Device.Extra[0].Path != "AdvertisedRoutes" {
-		t.Fatalf("extra properties = %#v, want AdvertisedRoutes", report.Device.Extra)
+	if deviceMatch == nil || webhookMatch == nil {
+		t.Fatalf("matches = %#v, want Device and Webhook", report.Model.Matches)
+	}
+	if !strings.Contains(strings.Join(deviceMatch.MissingProperties, ","), "multipleConnections") {
+		t.Fatalf("device missing properties = %#v, want multipleConnections", deviceMatch.MissingProperties)
+	}
+	if !strings.Contains(strings.Join(webhookMatch.MissingProperties, ","), "created") {
+		t.Fatalf("webhook missing properties = %#v, want created", webhookMatch.MissingProperties)
+	}
+	if len(webhookMatch.ExtraProperties) != 1 || webhookMatch.ExtraProperties[0].Path != "secret" {
+		t.Fatalf("webhook extra properties = %#v, want secret", webhookMatch.ExtraProperties)
 	}
 
 	if err := WriteMarkdown(report, outputDir); err != nil {
@@ -194,23 +186,25 @@ components:
 	if err != nil {
 		t.Fatalf("ReadFile(summary.md): %v", err)
 	}
-	if !strings.Contains(string(summary), "Endpoint operations") {
-		t.Fatalf("summary.md did not contain endpoint summary: %s", string(summary))
+	if !strings.Contains(string(summary), "API models") {
+		t.Fatalf("summary.md did not contain model summary: %s", string(summary))
 	}
 
-	endpoints, err := os.ReadFile(filepath.Join(outputDir, "endpoint-coverage.md"))
+	modelCoverage, err := os.ReadFile(filepath.Join(outputDir, "model-coverage.md"))
 	if err != nil {
-		t.Fatalf("ReadFile(endpoint-coverage.md): %v", err)
+		t.Fatalf("ReadFile(model-coverage.md): %v", err)
 	}
-	if !strings.Contains(string(endpoints), "expireDeviceKey") {
-		t.Fatalf("endpoint-coverage.md did not mention expireDeviceKey: %s", string(endpoints))
+	if !strings.Contains(string(modelCoverage), "ExtraModel") {
+		t.Fatalf("model-coverage.md did not mention ExtraModel: %s", string(modelCoverage))
 	}
 
-	deviceCoverage, err := os.ReadFile(filepath.Join(outputDir, "device-property-coverage.md"))
+	propertyCoverage, err := os.ReadFile(filepath.Join(outputDir, "model-property-coverage.md"))
 	if err != nil {
-		t.Fatalf("ReadFile(device-property-coverage.md): %v", err)
+		t.Fatalf("ReadFile(model-property-coverage.md): %v", err)
 	}
-	if !strings.Contains(string(deviceCoverage), "postureIdentity.hardwareAddresses") {
-		t.Fatalf("device-property-coverage.md did not mention missing posture field: %s", string(deviceCoverage))
+	for _, want := range []string{"multipleConnections", "created", "secret"} {
+		if !strings.Contains(string(propertyCoverage), want) {
+			t.Fatalf("model-property-coverage.md did not mention %q: %s", want, string(propertyCoverage))
+		}
 	}
 }

@@ -38,6 +38,13 @@ type Field struct {
 	Line int
 }
 
+type Model struct {
+	Name   string
+	File   string
+	Line   int
+	Fields []Field
+}
+
 type structInfo struct {
 	file string
 	node *ast.StructType
@@ -156,6 +163,34 @@ func (a *Analyzer) StructLeafJSONFields(typeName string) ([]Field, error) {
 	})
 
 	return out, nil
+}
+
+func (a *Analyzer) Models() ([]Model, error) {
+	models := make([]Model, 0, len(a.structs))
+	for name, info := range a.structs {
+		if !ast.IsExported(name) || !hasTaggedJSONFields(info.node) {
+			continue
+		}
+
+		fields, err := a.StructLeafJSONFields(name)
+		if err != nil {
+			return nil, err
+		}
+
+		position := a.fset.Position(info.node.Pos())
+		models = append(models, Model{
+			Name:   name,
+			File:   position.Filename,
+			Line:   position.Line,
+			Fields: fields,
+		})
+	}
+
+	slices.SortFunc(models, func(lhs, rhs Model) int {
+		return strings.Compare(lhs.Name, rhs.Name)
+	})
+
+	return models, nil
 }
 
 func (a *Analyzer) extractOperations(function *ast.FuncDecl) []Operation {
@@ -375,6 +410,8 @@ func (a *Analyzer) collectExprFields(expr ast.Expr, prefix string, out map[strin
 		if a.shouldRecurse(typed.Value) {
 			return a.collectExprFields(typed.Value, prefix, out, visiting)
 		}
+	case *ast.StructType:
+		return a.collectAnonymousStructFields(typed, prefix, out, visiting)
 	case *ast.Ident:
 		if _, ok := a.structs[typed.Name]; ok {
 			return a.collectStructFields(typed.Name, prefix, out, visiting)
@@ -399,12 +436,50 @@ func (a *Analyzer) shouldRecurse(expr ast.Expr) bool {
 		return a.shouldRecurse(typed.Elt)
 	case *ast.MapType:
 		return a.shouldRecurse(typed.Value)
+	case *ast.StructType:
+		return hasTaggedJSONFields(typed)
 	case *ast.Ident:
 		info, ok := a.structs[typed.Name]
 		return ok && hasTaggedJSONFields(info.node)
 	default:
 		return false
 	}
+}
+
+func (a *Analyzer) collectAnonymousStructFields(structType *ast.StructType, prefix string, out map[string]Field, visiting map[string]bool) error {
+	if !hasTaggedJSONFields(structType) {
+		position := a.fset.Position(structType.Pos())
+		out[prefix] = Field{
+			Path: prefix,
+			File: position.Filename,
+			Line: position.Line,
+		}
+		return nil
+	}
+
+	for _, field := range structType.Fields.List {
+		name, ok := jsonFieldName(field)
+		if !ok {
+			continue
+		}
+
+		path := joinPath(prefix, name)
+		if a.shouldRecurse(field.Type) {
+			if err := a.collectExprFields(field.Type, path, out, visiting); err != nil {
+				return err
+			}
+			continue
+		}
+
+		position := a.fset.Position(field.Pos())
+		out[path] = Field{
+			Path: path,
+			File: position.Filename,
+			Line: position.Line,
+		}
+	}
+
+	return nil
 }
 
 func hasTaggedJSONFields(structType *ast.StructType) bool {
